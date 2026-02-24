@@ -1,0 +1,9 @@
+*.sqlite
+logs/
+backtest_results/
+data_20240101-/
+data/
+freqaimodels/
+hyperopt_results/
+plot/
+__pycache__/
