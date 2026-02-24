@@ -45,9 +45,9 @@ TIMEFRAME           = "1h"
 DATA_FILE           = f"{FEATURE_STORING_DIR}{SYMBOL}-{TIMEFRAME}-futures.feather"
 
 # 訊號相關
-SWING_LENGTH      = 20    # Swing High/Low 偵測長度
-FUTURE_WINDOW     = 15    # 未來 N 根蠟燭用來計算標籤
-RR_THRESHOLD      = 1.0   # 盈虧比門檻（最大浮盈 / 最大浮虧 > 此值 → 有效訊號）
+SWING_LENGTH      = 25    # Swing High/Low 偵測長度
+MAX_LABEL_WINDOW  = 100   # 模擬最多往未來看幾根（防無限等待）
+MIN_RR_FILTER     = 1.0   # 進場前先過濾：目標/止損距離 RR < 此值則跳過
 
 # 訓練相關
 N_CV_SPLITS       = 5     # Walk-Forward 折數
@@ -114,7 +114,7 @@ def extract_features_at(idx: int, direction: int) -> dict:
     在第 idx 根 K 線提取所有特徵。
     direction: +1 (多頭訊號)，-1 (空頭訊號)
     """
-    if idx < SWING_LENGTH + 20 or idx + FUTURE_WINDOW >= len(df):
+    if idx < SWING_LENGTH + 20 or idx + MAX_LABEL_WINDOW >= len(df):
         return None
 
     row = df.iloc[idx]
@@ -212,32 +212,115 @@ def extract_features_at(idx: int, direction: int) -> dict:
 
 
 # ═══════════════════════════════════════════════════════
-# ⑥ 標籤生成：固定窗口盈虧比
+# ⑥ 標籤生成：SMC 結構目標（前高/前低 vs OB 止損）
 # ═══════════════════════════════════════════════════════
+
+def find_swing_target(idx: int, direction: int) -> float:
+    """
+    在訊號點 idx 之前，找最近的「結構目標」。
+    多頭(+1)：找 idx 之前、收盤價以上最近的擺盪高點（前高 = buy-side liquidity）
+    空頭(-1)：找 idx 之前、收盤價以下最近的擺盪低點（前低 = sell-side liquidity）
+    回傳目標價，找不到則回傳 np.nan。
+    """
+    entry = df["close"].iloc[idx]
+    shl = swing_hl["HighLow"][:idx]           # idx 之前的擺盪標記
+
+    if direction == 1:
+        # 擺盪高點（HighLow == 1）且高於進場價
+        highs_idx = shl[shl == 1].index
+        candidates = df["high"].loc[highs_idx]
+        above = candidates[candidates > entry]
+        if len(above) == 0:
+            return np.nan
+        return float(above.iloc[-1])           # 最近的前高
+    else:
+        # 擺盪低點（HighLow == -1）且低於進場價
+        lows_idx = shl[shl == -1].index
+        candidates = df["low"].loc[lows_idx]
+        below = candidates[candidates < entry]
+        if len(below) == 0:
+            return np.nan
+        return float(below.iloc[-1])           # 最近的前低
+
+
+def find_ob_stop(idx: int, direction: int) -> float:
+    """
+    取最近同方向 OB 的邊緣作為止損位。
+    多頭(+1)：OB 底部（Bottom）下方 = 止損
+    空頭(-1)：OB 頂部（Top）上方 = 止損
+    找不到 OB 則以訊號前 SWING_LENGTH 根的極值作為備用止損。
+    """
+    ob_col = ob_data["OB"] if "OB" in ob_data.columns else pd.Series(0, index=df.index)
+    recent_ob = ob_col[:idx + 1]
+    same_dir_ob = recent_ob[recent_ob == direction]
+
+    if len(same_dir_ob) > 0:
+        ob_idx = same_dir_ob.index[-1]
+        if direction == 1:
+            return float(ob_data["Bottom"][ob_idx]) if "Bottom" in ob_data.columns \
+                   else float(df["low"].iloc[ob_idx])
+        else:
+            return float(ob_data["Top"][ob_idx]) if "Top" in ob_data.columns \
+                   else float(df["high"].iloc[ob_idx])
+
+    # 備用：前 SWING_LENGTH 根的極值
+    window = df.iloc[max(0, idx - SWING_LENGTH): idx]
+    return float(window["low"].min()) if direction == 1 else float(window["high"].max())
+
 
 def compute_label(idx: int, direction: int) -> int:
     """
-    多頭（direction=+1）：進場 close，未來 FUTURE_WINDOW 根內
-        最大浮盈 = max(high) - entry
-        最大浮虧 = entry - min(low)
-    空頭（direction=-1）：反向計算
-    回傳 1 = 有效訊號，0 = 無效
+    SMC 結構目標標籤：
+      目標  = 最近前高（多頭）/ 前低（空頭）
+      止損  = 最近同方向 OB 邊緣
+      模擬  = 逐根 K 線往後掃，哪個先達到：
+              目標先到 → label=1（有效）
+              止損先到 → label=0（無效）
+              MAX_LABEL_WINDOW 內都沒到 → label=0
+      前置過濾：若 RR < MIN_RR_FILTER，直接跳過（回傳 np.nan）
     """
-    if idx + FUTURE_WINDOW >= len(df):
+    if idx + 1 >= len(df):
         return np.nan
+
     entry  = df["close"].iloc[idx]
-    future = df.iloc[idx + 1 : idx + 1 + FUTURE_WINDOW]
+    target = find_swing_target(idx, direction)
+    stop   = find_ob_stop(idx, direction)
 
+    # 目標 / 止損找不到 → 跳過
+    if np.isnan(target) or np.isnan(stop):
+        return np.nan
+
+    # 多頭：目標必須在進場上方，止損在進場下方
     if direction == 1:
-        max_gain = future["high"].max() - entry
-        max_loss = entry - future["low"].min()
+        if target <= entry or stop >= entry:
+            return np.nan
     else:
-        max_gain = entry - future["low"].min()
-        max_loss = future["high"].max() - entry
+        if target >= entry or stop <= entry:
+            return np.nan
 
-    if max_loss <= 0:
-        return 1 if max_gain > 0 else 0
-    return 1 if (max_gain / max_loss) >= RR_THRESHOLD else 0
+    # RR 前置過濾
+    reward = abs(target - entry)
+    risk   = abs(entry - stop)
+    if risk <= 0 or (reward / risk) < MIN_RR_FILTER:
+        return np.nan
+
+    # 逐根模擬
+    end = min(idx + 1 + MAX_LABEL_WINDOW, len(df))
+    for i in range(idx + 1, end):
+        bar_high = df["high"].iloc[i]
+        bar_low  = df["low"].iloc[i]
+        if direction == 1:
+            if bar_high >= target:
+                return 1   # 目標先到 → 有效
+            if bar_low <= stop:
+                return 0   # 止損先到 → 無效
+        else:
+            if bar_low <= target:
+                return 1
+            if bar_high >= stop:
+                return 0
+
+    return 0   # 逾時 → 無效
 
 
 # ═══════════════════════════════════════════════════════
@@ -246,26 +329,50 @@ def compute_label(idx: int, direction: int) -> int:
 print("\n🔍 收集 SMC 訊號點...")
 
 records = []
-fvg_col = fvg_data["FVG"]
+seen = set()   # 防止同一 idx 重複加入
 
-# 使用 FVG 作為候選進場點（可擴充其他觸發條件）
-for idx in fvg_col.dropna().index:
-    direction = int(fvg_col[idx])   # +1 多頭 FVG，-1 空頭 FVG
-    feats = extract_features_at(idx, direction)
+def _try_add(idx_val, dir_val):
+    key = (idx_val, dir_val)
+    if key in seen:
+        return
+    feats = extract_features_at(idx_val, dir_val)
     if feats is None:
-        continue
-    label = compute_label(idx, direction)
+        return
+    label = compute_label(idx_val, dir_val)
     if pd.isna(label):
-        continue
+        return
+    seen.add(key)
     records.append({
-        "idx":       idx,
-        "direction": direction,
+        "idx":       idx_val,
+        "direction": dir_val,
         "label":     int(label),
         **feats
     })
 
+# ① FVG 作為觸發點
+fvg_col = fvg_data["FVG"]
+for idx in fvg_col.dropna().index:
+    _try_add(int(idx), int(fvg_col[idx]))
+
+# ② BOS 作為觸發點
+if "BOS" in bos_data.columns:
+    bos_col = bos_data["BOS"]
+    for idx in bos_col.dropna().index:
+        if bos_col[idx] != 0:
+            _try_add(int(idx), int(np.sign(bos_col[idx])))
+
+# ③ CHoCH 作為觸發點
+if "CHOCH" in bos_data.columns:
+    choch_col = bos_data["CHOCH"]
+    for idx in choch_col.dropna().index:
+        if choch_col[idx] != 0:
+            _try_add(int(idx), int(np.sign(choch_col[idx])))
+
 df_signals = pd.DataFrame(records)
-print(f"   收集到 {len(df_signals)} 個 FVG 訊號點")
+# 依訊號點位置排序（確保 Walk-Forward 時序正確）
+df_signals = df_signals.sort_values("idx").reset_index(drop=True)
+
+print(f"   收集到 {len(df_signals)} 個訊號點（FVG + BOS + CHoCH）")
 print(f"   多頭訊號：{(df_signals['direction'] == 1).sum()}")
 print(f"   空頭訊號：{(df_signals['direction'] == -1).sum()}")
 print(f"   有效訊號（標籤=1）：{df_signals['label'].sum()} "
@@ -489,20 +596,23 @@ mean_f1   = cv_df["f1"].mean()        if len(cv_df) > 0 else float("nan")
 mean_auc  = cv_df["auc"].mean()       if len(cv_df) > 0 else float("nan")
 
 summary_rows = [
-    ("Timeframe",         f"{TIMEFRAME}"),
-    ("Total Candles",     f"{len(df):,}"),
-    ("Total FVG Signals", f"{total:,}"),
-    ("  Valid (label=1)", f"{valid_n:,}  ({valid_n/total*100:.1f}%)"),
-    ("  Invalid (label=0)",f"{invalid_n:,}  ({invalid_n/total*100:.1f}%)"),
-    ("RR Threshold",      f">= {RR_THRESHOLD}"),
-    ("Future Window",     f"{FUTURE_WINDOW} bars"),
-    ("-------------",     "----------"),
-    ("CV Folds",          f"{N_CV_SPLITS}"),
-    ("Mean Precision",    f"{mean_prec:.3f}"),
-    ("Mean Recall",       f"{mean_rec:.3f}"),
-    ("Mean F1",           f"{mean_f1:.3f}"),
-    ("Mean AUC",          f"{mean_auc:.3f}"),
-    ("Model",             "XGBoost" if USE_XGBOOST else "GradientBoosting"),
+    ("Timeframe",           f"{TIMEFRAME}"),
+    ("Total Candles",       f"{len(df):,}"),
+    ("Total FVG Signals",   f"{total:,}"),
+    ("  Valid (label=1)",   f"{valid_n:,}  ({valid_n/total*100:.1f}%)"),
+    ("  Invalid (label=0)", f"{invalid_n:,}  ({invalid_n/total*100:.1f}%)"),
+    ("Label Method",        "SMC Structure Target"),
+    ("Min RR Filter",       f">= {MIN_RR_FILTER}"),
+    ("Max Label Window",    f"{MAX_LABEL_WINDOW} bars"),
+    ("Target",              "Nearest Swing High/Low"),
+    ("Stop Loss",           "OB Edge (or Swing Extreme)"),
+    ("-------------",       "----------"),
+    ("CV Folds",            f"{N_CV_SPLITS}"),
+    ("Mean Precision",      f"{mean_prec:.3f}"),
+    ("Mean Recall",         f"{mean_rec:.3f}"),
+    ("Mean F1",             f"{mean_f1:.3f}"),
+    ("Mean AUC",            f"{mean_auc:.3f}"),
+    ("Model",               "XGBoost" if USE_XGBOOST else "GradientBoosting"),
 ]
 
 for row_i, (k, v) in enumerate(summary_rows):
