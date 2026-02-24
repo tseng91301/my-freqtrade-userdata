@@ -68,3 +68,4 @@ packaging==25.0
 matplotlib
 scikit-learn
 xgboost
+pytorch
