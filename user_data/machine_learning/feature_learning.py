@@ -277,10 +277,10 @@ def compute_label(idx: int, direction: int) -> int:
               目標先到 → label=1（有效）
               止損先到 → label=0（無效）
               MAX_LABEL_WINDOW 內都沒到 → label=0
-      前置過濾：若 RR < MIN_RR_FILTER，直接跳過（回傳 np.nan）
+      前置過濾：若 RR < MIN_RR_FILTER，直接跳過（回傳 (label, target, stop)，若跳過則回傳 (np.nan, np.nan, np.nan)）
     """
     if idx + 1 >= len(df):
-        return np.nan
+        return np.nan, np.nan, np.nan
 
     entry  = df["close"].iloc[idx]
     target = find_swing_target(idx, direction)
@@ -288,21 +288,21 @@ def compute_label(idx: int, direction: int) -> int:
 
     # 目標 / 止損找不到 → 跳過
     if np.isnan(target) or np.isnan(stop):
-        return np.nan
+        return np.nan, np.nan, np.nan
 
     # 多頭：目標必須在進場上方，止損在進場下方
     if direction == 1:
         if target <= entry or stop >= entry:
-            return np.nan
+            return np.nan, np.nan, np.nan
     else:
         if target >= entry or stop <= entry:
-            return np.nan
+            return np.nan, np.nan, np.nan
 
     # RR 前置過濾
     reward = abs(target - entry)
     risk   = abs(entry - stop)
     if risk <= 0 or (reward / risk) < MIN_RR_FILTER:
-        return np.nan
+        return np.nan, np.nan, np.nan
 
     # 逐根模擬
     end = min(idx + 1 + MAX_LABEL_WINDOW, len(df))
@@ -311,16 +311,16 @@ def compute_label(idx: int, direction: int) -> int:
         bar_low  = df["low"].iloc[i]
         if direction == 1:
             if bar_high >= target:
-                return 1   # 目標先到 → 有效
+                return 1, target, stop   # 目標先到 → 有效
             if bar_low <= stop:
-                return 0   # 止損先到 → 無效
+                return 0, target, stop   # 止損先到 → 無效
         else:
             if bar_low <= target:
-                return 1
+                return 1, target, stop
             if bar_high >= stop:
-                return 0
+                return 0, target, stop
 
-    return 0   # 逾時 → 無效
+    return 0, target, stop   # 逾時 → 無效
 
 
 # ═══════════════════════════════════════════════════════
@@ -338,14 +338,25 @@ def _try_add(idx_val, dir_val):
     feats = extract_features_at(idx_val, dir_val)
     if feats is None:
         return
-    label = compute_label(idx_val, dir_val)
+    label, target, stop = compute_label(idx_val, dir_val)
     if pd.isna(label):
         return
     seen.add(key)
+    
+    # 紀錄額外資訊
+    date = df["date"].iloc[idx_val] if "date" in df.columns else df.index[idx_val]
+    fvg_top = fvg_data["Top"][idx_val] if pd.notna(fvg_data["Top"][idx_val]) else np.nan
+    fvg_bottom = fvg_data["Bottom"][idx_val] if pd.notna(fvg_data["Bottom"][idx_val]) else np.nan
+
     records.append({
-        "idx":       idx_val,
-        "direction": dir_val,
-        "label":     int(label),
+        "idx":           idx_val,
+        "date":          date,
+        "direction":     dir_val,
+        "label":         int(label),
+        "fvg_top":       fvg_top,
+        "fvg_bottom":    fvg_bottom,
+        "target_price":  target,
+        "stop_price":    stop,
         **feats
     })
 
@@ -382,7 +393,8 @@ print(f"   有效訊號（標籤=1）：{df_signals['label'].sum()} "
 # ⑧ 模型訓練（Walk-Forward Cross-Validation）
 # ═══════════════════════════════════════════════════════
 FEATURE_COLS = [c for c in df_signals.columns
-                if c not in ("idx", "direction", "label", "atr_val")]
+                if c not in ("idx", "date", "direction", "label", "atr_val", 
+                             "fvg_top", "fvg_bottom", "target_price", "stop_price")]
 
 def build_model():
     if USE_XGBOOST:
