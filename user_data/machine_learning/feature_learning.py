@@ -41,7 +41,7 @@ from sklearn.preprocessing import StandardScaler
 # ═══════════════════════════════════════════════════════
 FEATURE_STORING_DIR = "../data_20240101-/binance/futures/"
 SYMBOL              = "BTC_USDT_USDT"
-TIMEFRAME           = "1h"
+TIMEFRAME           = "15m"
 DATA_FILE           = f"{FEATURE_STORING_DIR}{SYMBOL}-{TIMEFRAME}-futures.feather"
 
 # 訊號相關
@@ -84,9 +84,14 @@ print("\n📊 計算 SMC 指標...")
 
 swing_hl  = smc.swing_highs_lows(df, swing_length=SWING_LENGTH)
 fvg_data  = smc.fvg(df, join_consecutive=False)
+print("FVG count: ", len(fvg_data.dropna()))
 ob_data   = smc.ob(df, swing_hl, close_mitigation=False)
+print("OB count: ", len(ob_data.dropna()))
 bos_data  = smc.bos_choch(df, swing_hl, close_break=True)
+print("BOS count: ", len(bos_data.dropna()))
+print("CHoCH count: ", len(bos_data.dropna()))
 liq_data  = smc.liquidity(df, swing_hl)
+print("Liquidity count: ", len(liq_data.dropna()))
 
 print("   ✅ Swing High/Low、FVG、Order Block、BOS/CHoCH、Liquidity 計算完成")
 

@@ -44,7 +44,7 @@ SEQ_RAW_COLS = ["open", "high", "low", "close", "volume",
                 "atr", "vol_ma20", "trend_slope"]
 
 # 靜態特徵：排除非特徵欄位
-EXCLUDE_COLS = {"idx", "direction", "label", "atr_val"}
+EXCLUDE_COLS = {"idx", "direction", "label", "atr_val", "date"}
 
 
 # ═══════════════════════════════════════════════════════
